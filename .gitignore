@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.js.map
+.DS_Store
+.env
+tests/fixtures/opencode-project/.opencode/*.db
+tests/fixtures/opencode-project/.opencode/*.db-wal
+tests/fixtures/opencode-project/.opencode/*.db-shm

@@ -1,0 +1,60 @@
+{
+  "name": "session-convert",
+  "version": "0.1.0",
+  "description": "MCP server to convert AI coding agent sessions between Claude Code, Codex CLI, and OpenCode. The only tool supporting OpenCode SQLite session read/write. Claude-to-Codex, Claude-to-OpenCode, Codex-to-OpenCode and all reverse directions.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "session-convert": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:fixtures": "npx tsx tests/create-opencode-fixture.ts"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "claude-code",
+    "claude-code-session",
+    "codex-cli",
+    "codex-session",
+    "opencode",
+    "opencode-session",
+    "session-convert",
+    "session-migration",
+    "session-export",
+    "session-import",
+    "session-transfer",
+    "ai-coding-agent",
+    "coding-agent",
+    "context-switch",
+    "claude-to-codex",
+    "claude-to-opencode",
+    "codex-to-claude",
+    "codex-to-opencode",
+    "opencode-to-claude",
+    "opencode-to-codex",
+    "jsonl",
+    "sqlite",
+    "better-sqlite3",
+    "session-backup",
+    "session-portability"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^11.8.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.0"
+  }
+}
