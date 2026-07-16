@@ -5,7 +5,11 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 
 /**
- * Read Claude Code sessions from ~/.claude/projects/<hash>/sessions/<id>.jsonl
+ * Read Claude Code sessions from the supported Claude project layouts.
+ *
+ * Current Claude Code stores transcripts directly in
+ * ~/.claude/projects/<hash>/<id>.jsonl, while older installations used a
+ * nested sessions directory.
  */
 export class ClaudeReader {
   private claudeDir: string;
@@ -21,27 +25,21 @@ export class ClaudeReader {
     try {
       const projectHashes = await readdir(projectsDir);
       for (const hash of projectHashes) {
-        const sessionDir = join(projectsDir, hash, "sessions");
-        try {
-          const files = await readdir(sessionDir);
-          for (const file of files) {
-            if (!file.endsWith(".jsonl")) continue;
-            const sessionId = file.replace(".jsonl", "");
-            const filePath = join(sessionDir, file);
+        const projectPath = join(projectsDir, hash);
+        const files = await this.findSessionFiles(projectPath);
+        for (const filePath of files) {
+          const sessionId = filePath.split("/").pop()!.replace(/\.jsonl$/, "");
 
-            try {
-              const summary = await this.readSessionSummary(filePath, sessionId, hash);
-              if (cwdPrefix) {
-                const expanded = cwdPrefix.replace(/^~/, homedir());
-                if (!summary.cwd.startsWith(expanded)) continue;
-              }
-              summaries.push(summary);
-            } catch {
-              // skip
+          try {
+            const summary = await this.readSessionSummary(filePath, sessionId, hash);
+            if (cwdPrefix) {
+              const expanded = cwdPrefix.replace(/^~/, homedir());
+              if (!summary.cwd.startsWith(expanded)) continue;
             }
+            summaries.push(summary);
+          } catch {
+            // skip malformed or incomplete transcripts
           }
-        } catch {
-          // no sessions dir
         }
       }
     } catch {
@@ -57,12 +55,16 @@ export class ClaudeReader {
     try {
       const projectHashes = await readdir(projectsDir);
       for (const hash of projectHashes) {
-        const filePath = join(projectsDir, hash, "sessions", `${sessionId}.jsonl`);
-        try {
-          await access(filePath);
-          return await this.parseFile(filePath, sessionId, hash);
-        } catch {
-          continue;
+        const projectPath = join(projectsDir, hash);
+        const files = await this.findSessionFiles(projectPath);
+        for (const filePath of files) {
+          if (!filePath.endsWith(`/${sessionId}.jsonl`)) continue;
+          try {
+            await access(filePath);
+            return await this.parseFile(filePath, sessionId, hash);
+          } catch {
+            // try the next project layout
+          }
         }
       }
     } catch { /* no projects dir */ }
@@ -71,11 +73,29 @@ export class ClaudeReader {
 
   async readSessionByPath(filePath: string): Promise<Conversation> {
     const sessionId = filePath.replace(/\.jsonl$/, "").split("/").pop()!;
-    const hash = filePath.split("/").slice(-3)[0]; // <hash>/sessions/<id>.jsonl
+    const hash = filePath.split("/").slice(-3)[0];
     return this.parseFile(filePath, sessionId, hash);
   }
 
   // ---- Internal ----
+
+  private async findSessionFiles(projectPath: string): Promise<string[]> {
+    const sessionDirs = [projectPath, join(projectPath, "sessions")];
+    const files = new Set<string>();
+
+    for (const sessionDir of sessionDirs) {
+      try {
+        const entries = await readdir(sessionDir);
+        for (const entry of entries) {
+          if (entry.endsWith(".jsonl")) files.add(join(sessionDir, entry));
+        }
+      } catch {
+        // The directory may not exist for the other supported layout.
+      }
+    }
+
+    return [...files];
+  }
 
   private async readSessionSummary(
     filePath: string,
@@ -100,7 +120,7 @@ export class ClaudeReader {
 
         if (!cwd && entry.cwd) cwd = entry.cwd;
 
-        if (entry.type === "user" && !title) {
+        if (entry.type === "user" && title === "Untitled") {
           const text = this.extractText(entry.message?.content);
           if (text) title = text.slice(0, 120);
         }
@@ -162,7 +182,7 @@ export class ClaudeReader {
 
         if (entry.type === "user") {
           const text = this.extractText(entry.message?.content);
-          if (!title && text) title = text.slice(0, 120);
+          if (title === "Untitled" && text) title = text.slice(0, 120);
 
           const parts = this.convertUserContent(entry.message?.content);
           if (parts.length > 0) {

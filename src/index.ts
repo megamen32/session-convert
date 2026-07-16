@@ -68,7 +68,7 @@ async function main() {
       sessionId: z.string().describe("Session ID to convert"),
       from: z.enum(["claude", "codex", "opencode"]).describe("Source harness"),
       to: z.enum(["claude", "codex", "opencode"]).describe("Target harness"),
-      projectPath: z.string().optional().describe("For OpenCode target: override the project directory where .opencode/opencode.db will be created/updated"),
+      projectPath: z.string().optional().describe("For OpenCode target: explicitly use this project-local .opencode/opencode.db; omitted uses the current global OpenCode database"),
       searchPaths: z.array(z.string()).optional().describe("For OpenCode source: paths to search for databases"),
     },
     async (args) => {

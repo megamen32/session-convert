@@ -1,14 +1,14 @@
 import { Conversation, ConversionResult, ContentPart } from "../types.js";
-import { mkdir } from "node:fs/promises";
+import { access, mkdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
+import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
 
 /**
  * Write conversations into an OpenCode SQLite database.
- * Creates/opens <project>/.opencode/opencode.db and inserts sessions + messages.
- *
- * This is the unique capability — no other tool can write sessions INTO OpenCode.
+ * Creates/opens the current global OpenCode database, or an explicit
+ * project-local .opencode/opencode.db when projectPath is provided.
  */
 export class OpenCodeWriter {
   /**
@@ -17,8 +17,8 @@ export class OpenCodeWriter {
   async write(conv: Conversation, projectPath?: string): Promise<ConversionResult> {
     const warnings: string[] = [];
     const projectDir = projectPath || conv.cwd;
-    const dbDir = join(projectDir, ".opencode");
-    const dbPath = join(dbDir, "opencode.db");
+    const dbPath = await this.resolveDatabasePath(projectPath, projectDir);
+    const dbDir = dirname(dbPath);
 
     await mkdir(dbDir, { recursive: true });
 
@@ -37,13 +37,19 @@ export class OpenCodeWriter {
       db.pragma("journal_mode = WAL");
       db.pragma("foreign_keys = ON");
 
+      if (this.hasTable(db, "session")) {
+        const result = this.writeCurrentSchema(db, conv, projectDir, warnings);
+        db.close();
+        return result;
+      }
+
       // Create tables if they don't exist (basic schema)
       this.ensureSchema(db);
 
       const sessionId = conv.id || randomUUID();
-      const now = Math.floor(Date.now() / 1000);
-      const createdAt = conv.createdAt ? Math.floor(new Date(conv.createdAt).getTime() / 1000) : now;
-      const updatedAt = conv.updatedAt ? Math.floor(new Date(conv.updatedAt).getTime() / 1000) : now;
+      const now = Date.now();
+      const createdAt = conv.createdAt ? new Date(conv.createdAt).getTime() : now;
+      const updatedAt = conv.updatedAt ? new Date(conv.updatedAt).getTime() : now;
 
       // Determine model from conversation
       const model = conv.model || this.detectModel(conv);
@@ -77,7 +83,7 @@ export class OpenCodeWriter {
 
         const msgId = msg.id || randomUUID();
         const msgTs = msg.timestamp
-          ? Math.floor(new Date(msg.timestamp).getTime() / 1000)
+          ? new Date(msg.timestamp).getTime()
           : now;
         const msgModel = msg.model || model;
 
@@ -115,6 +121,172 @@ export class OpenCodeWriter {
         error: `Failed to write to OpenCode DB: ${(err as Error).message}`,
       };
     }
+  }
+
+  private async resolveDatabasePath(projectPath: string | undefined, projectDir: string): Promise<string> {
+    const projectDb = join(projectDir, ".opencode", "opencode.db");
+    if (projectPath) return projectDb;
+
+    const globalDb = process.env.OPENCODE_DB_PATH
+      || join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode", "opencode.db");
+    try {
+      await access(globalDb);
+      return globalDb;
+    } catch {
+      return projectDb;
+    }
+  }
+
+  private writeCurrentSchema(
+    db: Database.Database,
+    conv: Conversation,
+    projectDir: string,
+    warnings: string[],
+  ): ConversionResult {
+    const project = db.prepare("SELECT id FROM project WHERE id = 'global' OR worktree = ? ORDER BY id = 'global' DESC LIMIT 1").get(projectDir) as { id: string } | undefined;
+    if (!project) {
+      return {
+        success: false,
+        error: `OpenCode current database has no project record for ${projectDir}`,
+      };
+    }
+
+    const versionRow = db.prepare("SELECT version FROM session ORDER BY time_updated DESC LIMIT 1").get() as { version: string } | undefined;
+    const version = versionRow?.version || "1.0.0";
+    const modelId = conv.model || this.detectModel(conv);
+    const providerID = modelId.includes("/") ? modelId.split("/", 1)[0] : "session-convert";
+    const now = Date.now();
+    const createdAt = conv.createdAt ? new Date(conv.createdAt).getTime() : now;
+    const updatedAt = conv.updatedAt ? new Date(conv.updatedAt).getTime() : now;
+    const sessionId = this.newOpenCodeId("ses");
+    const title = conv.title.slice(0, 500);
+    const slug = this.slugify(title) || sessionId.slice(4);
+
+    const insertSession = db.prepare(
+      "INSERT INTO session (id, project_id, slug, directory, title, version, cost, tokens_input, " +
+      "tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, agent, model, time_created, time_updated) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    );
+    const insertMessage = db.prepare(
+      "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)"
+    );
+    const insertPart = db.prepare(
+      "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)"
+    );
+
+    const write = db.transaction(() => {
+      insertSession.run(
+        sessionId,
+        project.id,
+        slug,
+        projectDir,
+        title,
+        version,
+        conv.costUsd || 0,
+        conv.tokenUsage?.inputTokens || 0,
+        conv.tokenUsage?.outputTokens || 0,
+        conv.tokenUsage?.reasoningTokens || 0,
+        conv.tokenUsage?.cacheReadTokens || 0,
+        conv.tokenUsage?.cacheWriteTokens || 0,
+        "coder",
+        JSON.stringify({ id: modelId, providerID, variant: "default" }),
+        createdAt,
+        updatedAt,
+      );
+
+      let parentId: string | null = null;
+      for (const msg of conv.messages) {
+        const messageId = this.newOpenCodeId("msg");
+        const timestamp = msg.timestamp ? new Date(msg.timestamp).getTime() : now;
+        const messageModel = msg.model || modelId;
+        const messageData = {
+          ...(parentId ? { parentID: parentId } : {}),
+          role: msg.role === "assistant" ? "assistant" : "user",
+          mode: "coder",
+          agent: "coder",
+          variant: "default",
+          path: { cwd: projectDir, root: "/" },
+          cost: 0,
+          tokens: {
+            input: msg.usage?.inputTokens || 0,
+            output: msg.usage?.outputTokens || 0,
+            reasoning: msg.usage?.reasoningTokens || 0,
+            cache: {
+              read: msg.usage?.cacheReadTokens || 0,
+              write: msg.usage?.cacheWriteTokens || 0,
+            },
+          },
+          modelID: messageModel,
+          providerID,
+          time: { created: timestamp },
+        };
+        insertMessage.run(messageId, sessionId, timestamp, timestamp, JSON.stringify(messageData));
+
+        for (const part of this.toCurrentOpenCodeParts(msg.parts, timestamp, warnings)) {
+          const partId = this.newOpenCodeId("prt");
+          insertPart.run(partId, messageId, sessionId, timestamp, timestamp, JSON.stringify(part));
+        }
+        parentId = messageId;
+      }
+    });
+
+    write();
+    return {
+      success: true,
+      targetSessionId: sessionId,
+      targetPath: db.name,
+      messageCount: conv.messages.length,
+      warnings: warnings.length > 0 ? warnings : undefined,
+    };
+  }
+
+  private toCurrentOpenCodeParts(parts: ContentPart[], timestamp: number, warnings: string[]): unknown[] {
+    const result: unknown[] = [];
+    for (const part of parts) {
+      if (part.type === "text") {
+        result.push({ type: "text", text: part.text, time: { start: timestamp, end: timestamp } });
+      } else if (part.type === "thinking") {
+        result.push({ type: "reasoning", text: part.text, time: { start: timestamp, end: timestamp } });
+      } else if (part.type === "tool_call") {
+        result.push({
+          type: "tool",
+          tool: part.name,
+          callID: part.id,
+          state: {
+            status: part.finished === false ? "pending" : "completed",
+            input: part.input,
+            output: "",
+          },
+        });
+      } else if (part.type === "tool_result") {
+        result.push({
+          type: "tool",
+          tool: part.name || "unknown",
+          callID: part.toolCallId,
+          state: {
+            status: part.isError ? "error" : "completed",
+            input: {},
+            output: part.content,
+          },
+        });
+      } else if (part.type === "image") {
+        warnings.push("Image parts are not written to the current OpenCode schema");
+      }
+    }
+    return result;
+  }
+
+  private hasTable(db: Database.Database, tableName: string): boolean {
+    const row = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName);
+    return row !== undefined;
+  }
+
+  private newOpenCodeId(prefix: string): string {
+    return `${prefix}_${randomUUID().replaceAll("-", "")}`;
+  }
+
+  private slugify(title: string): string {
+    return title.toLowerCase().replace(/[^a-z0-9а-яё]+/gi, "-").replace(/^-|-$/g, "").slice(0, 80);
   }
 
   private ensureSchema(db: Database.Database): void {
