@@ -40,6 +40,9 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
 `);
 
+// Keep repeated fixture generation deterministic for local and CI reruns.
+db.exec("DELETE FROM messages; DELETE FROM sessions;");
+
 const sessionId = "opencode-test-session";
 const now = Math.floor(Date.now() / 1000);
 const base = now - 300;

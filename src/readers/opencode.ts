@@ -6,9 +6,7 @@ import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
 
 /**
- * Read OpenCode sessions from SQLite databases.
- * OpenCode stores sessions in <project>/.opencode/opencode.db
- * We scan for these databases across the filesystem.
+ * Read OpenCode sessions from current global and legacy project-local SQLite databases.
  */
 export class OpenCodeReader {
   private dataHome: string;
@@ -19,17 +17,27 @@ export class OpenCodeReader {
 
   /**
    * Find all OpenCode databases.
-   * Scans known project directories for .opencode/opencode.db files.
+   * Includes the current global database and scans known project directories
+   * for legacy .opencode/opencode.db files.
    */
   async findDatabases(searchPaths?: string[]): Promise<string[]> {
     const dbs: string[] = [];
+    const globalDb = join(this.dataHome, "opencode", "opencode.db");
+
+    try {
+      await access(globalDb);
+      dbs.push(globalDb);
+    } catch {
+      // OpenCode may only have project-local databases.
+    }
+
     const paths = searchPaths || [homedir()];
 
     for (const searchPath of paths) {
       await this.scanForDbs(searchPath, dbs, 0, 3);
     }
 
-    return dbs;
+    return [...new Set(dbs)];
   }
 
   /**
@@ -39,6 +47,9 @@ export class OpenCodeReader {
     let db: Database.Database | null = null;
     try {
       db = new Database(dbPath, { readonly: true });
+      if (this.hasTable(db, "session")) {
+        return this.queryCurrentSessions(db, dbPath, cwdPrefix);
+      }
       const sessions = await this.querySessions(db, dbPath, cwdPrefix);
       return sessions;
     } catch (err) {
@@ -150,12 +161,8 @@ export class OpenCodeReader {
           if (!cwd.startsWith(expanded)) continue;
         }
 
-        const updatedAt = row.updated_at
-          ? new Date((row.updated_at as number) * 1000).toISOString()
-          : new Date().toISOString();
-        const createdAt = row.created_at
-          ? new Date((row.created_at as number) * 1000).toISOString()
-          : updatedAt;
+        const updatedAt = toIsoTimestamp(row.updated_at) || new Date().toISOString();
+        const createdAt = toIsoTimestamp(row.created_at) || updatedAt;
 
         sessions.push({
           id: row.id as string,
@@ -177,7 +184,48 @@ export class OpenCodeReader {
     return sessions;
   }
 
+  private queryCurrentSessions(db: Database.Database, dbPath: string, cwdPrefix?: string): SessionSummary[] {
+    const sessions: SessionSummary[] = [];
+    const rows = db.prepare(
+      "SELECT id, title, directory, model, time_created, time_updated " +
+      "FROM session ORDER BY time_updated DESC LIMIT 200"
+    ).all() as Array<Record<string, unknown>>;
+
+    for (const row of rows) {
+      const cwd = (row.directory as string) || dirname(dirname(dbPath));
+      if (cwdPrefix) {
+        const expanded = cwdPrefix.replace(/^~/, homedir());
+        if (!cwd.startsWith(expanded)) continue;
+      }
+
+      const updatedAt = toIsoTimestamp(row.time_updated) || new Date().toISOString();
+      const createdAt = toIsoTimestamp(row.time_created) || updatedAt;
+      sessions.push({
+        id: row.id as string,
+        harness: "opencode",
+        title: (row.title as string) || "Untitled",
+        cwd,
+        model: parseModelId(row.model),
+        createdAt,
+        updatedAt,
+        messageCount: this.countCurrentMessages(db, row.id as string),
+        sourcePath: dbPath,
+      });
+    }
+
+    return sessions;
+  }
+
+  private countCurrentMessages(db: Database.Database, sessionId: string): number {
+    const row = db.prepare("SELECT COUNT(*) AS count FROM message WHERE session_id = ?").get(sessionId) as { count: number };
+    return row.count;
+  }
+
   private readConversation(db: Database.Database, sessionId: string, dbPath: string): Conversation | null {
+    if (this.hasTable(db, "session")) {
+      return this.readCurrentConversation(db, sessionId, dbPath);
+    }
+
     try {
       const sessionRow = db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as Record<string, unknown> | undefined;
       if (!sessionRow) return null;
@@ -210,9 +258,7 @@ export class OpenCodeReader {
       for (const row of msgRows) {
         if (row.model) model = row.model as string;
         const parts = this.parseParts(row.parts as string);
-        const ts = row.created_at
-          ? new Date((row.created_at as number) * 1000).toISOString()
-          : undefined;
+        const ts = toIsoTimestamp(row.created_at);
 
         messages.push({
           id: row.id as string,
@@ -223,12 +269,8 @@ export class OpenCodeReader {
         });
       }
 
-      const updatedAt = sessionRow.updated_at
-        ? new Date((sessionRow.updated_at as number) * 1000).toISOString()
-        : new Date().toISOString();
-      const createdAt = sessionRow.created_at
-        ? new Date((sessionRow.created_at as number) * 1000).toISOString()
-        : updatedAt;
+      const updatedAt = toIsoTimestamp(sessionRow.updated_at) || new Date().toISOString();
+      const createdAt = toIsoTimestamp(sessionRow.created_at) || updatedAt;
 
       return {
         id: sessionId,
@@ -250,6 +292,74 @@ export class OpenCodeReader {
       console.error(`[session-convert] Error reading conversation: ${(err as Error).message}`);
       return null;
     }
+  }
+
+  private readCurrentConversation(db: Database.Database, sessionId: string, dbPath: string): Conversation | null {
+    try {
+      const sessionRow = db.prepare("SELECT * FROM session WHERE id = ?").get(sessionId) as Record<string, unknown> | undefined;
+      if (!sessionRow) return null;
+
+      const rows = db.prepare(
+        "SELECT m.id AS message_id, m.data AS message_data, m.time_created AS message_created, " +
+        "p.id AS part_id, p.data AS part_data, p.time_created AS part_created " +
+        "FROM message m LEFT JOIN part p ON p.message_id = m.id " +
+        "WHERE m.session_id = ? ORDER BY m.time_created ASC, p.time_created ASC"
+      ).all(sessionId) as Array<Record<string, unknown>>;
+
+      const messageMap = new Map<string, Message>();
+      for (const row of rows) {
+        const messageId = row.message_id as string;
+        let message = messageMap.get(messageId);
+        if (!message) {
+          const data = parseJsonObject(row.message_data);
+          const role = data.role === "assistant" ? "assistant" : "user";
+          message = {
+            id: messageId,
+            role,
+            parts: [],
+            model: typeof data.modelID === "string" ? data.modelID : undefined,
+            timestamp: toIsoTimestamp(row.message_created),
+          };
+          messageMap.set(messageId, message);
+        }
+
+        if (row.part_data) {
+          message.parts.push(...parseCurrentParts(row.part_data as string));
+        }
+      }
+
+      const messages = [...messageMap.values()];
+      const createdAt = toIsoTimestamp(sessionRow.time_created) || new Date().toISOString();
+      const updatedAt = toIsoTimestamp(sessionRow.time_updated) || createdAt;
+
+      return {
+        id: sessionId,
+        sourceHarness: "opencode",
+        cwd: (sessionRow.directory as string) || dirname(dirname(dbPath)),
+        model: parseModelId(sessionRow.model),
+        title: (sessionRow.title as string) || "Untitled",
+        createdAt,
+        updatedAt,
+        messages,
+        costUsd: typeof sessionRow.cost === "number" ? sessionRow.cost : undefined,
+        tokenUsage: {
+          inputTokens: (sessionRow.tokens_input as number) || undefined,
+          outputTokens: (sessionRow.tokens_output as number) || undefined,
+          reasoningTokens: (sessionRow.tokens_reasoning as number) || undefined,
+          cacheReadTokens: (sessionRow.tokens_cache_read as number) || undefined,
+          cacheWriteTokens: (sessionRow.tokens_cache_write as number) || undefined,
+        },
+        meta: { sourceFormat: "opencode-sqlite-current", dbPath },
+      };
+    } catch (err) {
+      console.error(`[session-convert] Error reading current OpenCode conversation: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  private hasTable(db: Database.Database, tableName: string): boolean {
+    const row = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName);
+    return row !== undefined;
   }
 
   /**
@@ -306,4 +416,87 @@ export class OpenCodeReader {
 
     return parts;
   }
+}
+
+function parseJsonObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== "string") return {};
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function parseModelId(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const parsed = parseJsonObject(value);
+    if (typeof parsed.id === "string") {
+      return parsed.providerID && typeof parsed.providerID === "string"
+        ? `${parsed.providerID}/${parsed.id}`
+        : parsed.id;
+    }
+    return value;
+  }
+  if (!value || typeof value !== "object") return undefined;
+  const model = value as Record<string, unknown>;
+  if (typeof model.id !== "string") return undefined;
+  return model.providerID && typeof model.providerID === "string"
+    ? `${model.providerID}/${model.id}`
+    : model.id;
+}
+
+function parseCurrentParts(partsJson: string): ContentPart[] {
+  const data = parseJsonObject(partsJson);
+  switch (data.type) {
+    case "text":
+      return typeof data.text === "string" ? [{ type: "text", text: data.text }] : [];
+    case "reasoning":
+      return typeof data.text === "string" ? [{ type: "thinking", text: data.text }] : [];
+    case "tool": {
+      const state = data.state && typeof data.state === "object"
+        ? data.state as Record<string, unknown>
+        : {};
+      const input = state.input && typeof state.input === "object"
+        ? state.input as Record<string, unknown>
+        : {};
+      const callId = typeof data.callID === "string" ? data.callID : randomUUID();
+      const toolName = typeof data.tool === "string" ? data.tool : "unknown";
+      const status = state.status;
+      const call: ContentPart = {
+        type: "tool_call",
+        id: callId,
+        name: toolName,
+        input,
+        finished: status === "completed" || status === "error",
+      };
+      if (typeof state.output === "string") {
+        return [call, {
+          type: "tool_result",
+          toolCallId: callId,
+          name: toolName,
+          content: state.output.slice(0, 50_000),
+          isError: status === "error",
+        }];
+      }
+      return [call];
+    }
+    default:
+      return [];
+  }
+}
+
+/**
+ * Convert OpenCode epoch timestamps to ISO strings.
+ *
+ * OpenCode currently stores milliseconds, while older local databases used
+ * seconds. Detecting the unit keeps old exports readable without writing new
+ * data in the legacy format.
+ */
+function toIsoTimestamp(value: unknown): string | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  const milliseconds = value < 100_000_000_000 ? value * 1000 : value;
+  return new Date(milliseconds).toISOString();
 }

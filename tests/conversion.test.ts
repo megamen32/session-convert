@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdtemp, rm, readFile, readdir, stat, access } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readFile, readdir, stat, access, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import Database from "better-sqlite3";
 import { ClaudeReader } from "../src/readers/claude.js";
@@ -41,6 +41,50 @@ afterAll(async () => {
 // ===== Reader Tests =====
 
 describe("ClaudeReader", () => {
+  it("discovers current Claude sessions stored directly in the project directory", async () => {
+    const claudeHome = await mkdtemp(join(homedir(), "sc-test-claude-home-"));
+    const projectPath = join(claudeHome, "projects", "-home-roomhacker-PycharmProjects-TelegramAuto");
+    const sessionId = "direct-layout-session";
+
+    await mkdir(projectPath, { recursive: true });
+    await writeFile(
+      join(projectPath, `${sessionId}.jsonl`),
+      [
+        JSON.stringify({
+          type: "user",
+          uuid: "user-1",
+          cwd: "/home/roomhacker/PycharmProjects/TelegramAuto",
+          timestamp: "2026-07-16T10:00:00.000Z",
+          message: { role: "user", content: "Fix session converter" },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          uuid: "assistant-1",
+          cwd: "/home/roomhacker/PycharmProjects/TelegramAuto",
+          timestamp: "2026-07-16T10:00:01.000Z",
+          message: {
+            role: "assistant",
+            model: "claude-sonnet-4-20250514",
+            content: [{ type: "text", text: "I will inspect the converter." }],
+          },
+        }),
+      ].join("\n") + "\n",
+    );
+
+    try {
+      const reader = new ClaudeReader(claudeHome);
+      const sessions = await reader.listSessions("/home/roomhacker/PycharmProjects/TelegramAuto");
+      const conversation = await reader.readSession(sessionId);
+
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].title).toBe("Fix session converter");
+      expect(conversation).not.toBeNull();
+      expect(conversation!.title).toBe("Fix session converter");
+    } finally {
+      await rm(claudeHome, { recursive: true, force: true });
+    }
+  });
+
   it("reads a Claude JSONL session into unified format", async () => {
     const reader = new ClaudeReader();
     const conv = await reader.readSessionByPath(claudeFixturePath);
@@ -216,6 +260,55 @@ describe("OpenCodeReader", () => {
     expect(conv!.model).toContain("claude");
     expect(conv!.costUsd).toBeGreaterThan(0);
   });
+
+  it("reads the current OpenCode session/message/part schema", async () => {
+    const tempDir = await mkdtemp(join(homedir(), "sc-test-current-opencode-reader-"));
+    const dbPath = join(tempDir, ".opencode", "opencode.db");
+    await createCurrentOpenCodeDatabase(dbPath);
+
+    const db = new Database(dbPath);
+    db.prepare(
+      "INSERT INTO session (id, project_id, slug, directory, title, version, model, time_created, time_updated) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(
+      "ses-current-reader",
+      "global",
+      "current-reader",
+      "/home/dev/test-project",
+      "Current schema session",
+      "1.17.18",
+      JSON.stringify({ id: "MiniMax-M3", providerID: "minimax-coding-plan" }),
+      1_750_000_000_000,
+      1_750_000_001_000,
+    );
+    db.prepare("INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)").run(
+      "msg-current-reader",
+      "ses-current-reader",
+      1_750_000_000_000,
+      1_750_000_000_000,
+      JSON.stringify({ role: "assistant", modelID: "MiniMax-M3" }),
+    );
+    db.prepare("INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)").run(
+      "prt-current-reader",
+      "msg-current-reader",
+      "ses-current-reader",
+      1_750_000_000_001,
+      1_750_000_000_001,
+      JSON.stringify({ type: "text", text: "Current OpenCode works." }),
+    );
+    db.close();
+
+    try {
+      const conv = await new OpenCodeReader().readSessionFromDb(dbPath, "ses-current-reader");
+      expect(conv).not.toBeNull();
+      expect(conv!.title).toBe("Current schema session");
+      expect(conv!.model).toBe("minimax-coding-plan/MiniMax-M3");
+      expect(conv!.messages).toHaveLength(1);
+      expect(conv!.messages[0].parts).toEqual([{ type: "text", text: "Current OpenCode works." }]);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ===== Writer Tests =====
@@ -355,6 +448,59 @@ describe("OpenCodeWriter", () => {
     expect(toolCalls[0].data.id).toBeTruthy();
     expect(toolCalls[0].data.name).toBeTruthy();
     expect(toolCalls[0].data.input).toBeDefined();
+  });
+
+  it("writes and reads OpenCode timestamps in milliseconds", async () => {
+    const writer = new OpenCodeWriter();
+    const reader = new OpenCodeReader();
+    const conv = makeMiniConversation("oc-millisecond-timestamps-test", "opencode");
+    const result = await writer.write(conv, opencodeOutDir);
+
+    expect(result.success).toBe(true);
+
+    const db = new Database(result.targetPath!, { readonly: true });
+    const session = db.prepare("SELECT created_at, updated_at FROM sessions WHERE id = ?").get(result.targetSessionId) as {
+      created_at: number;
+      updated_at: number;
+    };
+    db.close();
+
+    expect(session.created_at).toBeGreaterThan(1_000_000_000_000);
+    expect(session.updated_at).toBeGreaterThan(1_000_000_000_000);
+
+    const roundtrip = await reader.readSessionFromDb(result.targetPath!, result.targetSessionId!);
+    expect(roundtrip!.createdAt).toBe(conv.createdAt);
+    expect(roundtrip!.updatedAt).toBe(conv.updatedAt);
+  });
+
+  it("writes a session into the current OpenCode schema", async () => {
+    const tempDir = await mkdtemp(join(homedir(), "sc-test-current-opencode-writer-"));
+    const dbPath = join(tempDir, ".opencode", "opencode.db");
+    await createCurrentOpenCodeDatabase(dbPath);
+
+    try {
+      const conv = makeMiniConversation("oc-current-schema-test", "claude");
+      const result = await new OpenCodeWriter().write(conv, tempDir);
+
+      expect(result.success).toBe(true);
+      expect(result.targetSessionId).toMatch(/^ses_/);
+      expect(result.targetPath).toBe(dbPath);
+
+      const db = new Database(dbPath, { readonly: true });
+      const counts = db.prepare(
+        "SELECT (SELECT COUNT(*) FROM message WHERE session_id = ?) AS messages, " +
+        "(SELECT COUNT(*) FROM part WHERE session_id = ?) AS parts"
+      ).get(result.targetSessionId, result.targetSessionId) as { messages: number; parts: number };
+      db.close();
+      expect(counts.messages).toBe(conv.messages.length);
+      expect(counts.parts).toBeGreaterThan(0);
+
+      const roundtrip = await new OpenCodeReader().readSessionFromDb(dbPath, result.targetSessionId!);
+      expect(roundtrip!.messages.length).toBe(conv.messages.length);
+      expect(roundtrip!.title).toBe(conv.title);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -592,6 +738,81 @@ describe("Edge cases", () => {
 });
 
 // ===== Helper =====
+
+async function createCurrentOpenCodeDatabase(dbPath: string): Promise<void> {
+  await mkdir(dirname(dbPath), { recursive: true });
+  const db = new Database(dbPath);
+  db.exec(`
+    CREATE TABLE project (
+      id TEXT PRIMARY KEY,
+      worktree TEXT NOT NULL,
+      vcs TEXT,
+      name TEXT,
+      icon_url TEXT,
+      icon_url_override TEXT,
+      icon_color TEXT,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL,
+      time_initialized INTEGER,
+      sandboxes TEXT NOT NULL,
+      commands TEXT
+    );
+    CREATE TABLE session (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      workspace_id TEXT,
+      parent_id TEXT,
+      slug TEXT NOT NULL,
+      directory TEXT NOT NULL,
+      path TEXT,
+      title TEXT NOT NULL,
+      version TEXT NOT NULL,
+      share_url TEXT,
+      summary_additions INTEGER,
+      summary_deletions INTEGER,
+      summary_files INTEGER,
+      summary_diffs TEXT,
+      metadata TEXT,
+      cost REAL DEFAULT 0 NOT NULL,
+      tokens_input INTEGER DEFAULT 0 NOT NULL,
+      tokens_output INTEGER DEFAULT 0 NOT NULL,
+      tokens_reasoning INTEGER DEFAULT 0 NOT NULL,
+      tokens_cache_read INTEGER DEFAULT 0 NOT NULL,
+      tokens_cache_write INTEGER DEFAULT 0 NOT NULL,
+      revert TEXT,
+      permission TEXT,
+      agent TEXT,
+      model TEXT,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL,
+      time_compacting INTEGER,
+      time_archived INTEGER
+    );
+    CREATE TABLE message (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL,
+      data TEXT NOT NULL
+    );
+    CREATE TABLE part (
+      id TEXT PRIMARY KEY,
+      message_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL,
+      data TEXT NOT NULL
+    );
+  `);
+  db.prepare("INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) VALUES (?, ?, ?, ?, ?)").run(
+    "global",
+    "/",
+    Date.now(),
+    Date.now(),
+    "[]",
+  );
+  db.close();
+}
 
 function makeMiniConversation(id: string, source: "claude" | "codex" | "opencode"): Conversation {
   return {

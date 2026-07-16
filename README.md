@@ -9,9 +9,9 @@ The only tool that supports **OpenCode SQLite** session conversion — [agent-co
 You're using multiple AI coding agents (Claude Code, Codex CLI, OpenCode) and want to **migrate a session from one to another** — maybe you started in Claude Code but want to continue in OpenCode, or you found a great Codex session that would be useful in Claude.
 
 Each agent stores sessions differently:
-- **Claude Code** — JSONL files in `~/.claude/projects/<hash>/sessions/`
+- **Claude Code** — JSONL files in `~/.claude/projects/<hash>/<session-id>.jsonl` (legacy nested `sessions/` is also supported)
 - **Codex CLI** — Rollout JSONL in `~/.codex/sessions/YYYY/MM/DD/`
-- **OpenCode** — SQLite database in `<project>/.opencode/opencode.db`
+- **OpenCode** — current SQLite database in `~/.local/share/opencode/opencode.db`; legacy project-local databases in `<project>/.opencode/opencode.db` are also supported
 
 This MCP server reads from any of these, normalizes into a unified format, and writes to any other. **All 6 conversion directions work** (Claude→Codex, Claude→OpenCode, Codex→Claude, Codex→OpenCode, OpenCode→Claude, OpenCode→Codex).
 
@@ -123,7 +123,7 @@ Source format  →  Unified Conversation  →  Target format
 
 - **Claude Code** stores sessions as one JSON object per line in `.jsonl` files. Tool calls are `tool_use` blocks, results are `tool_result` blocks in the next user message. Thinking blocks are stored as `thinking` content type.
 - **Codex CLI** uses a `session_meta` header line followed by `response_item` entries. Tool calls are separate `function_call` items with matching `function_call_output` items. Reasoning is a separate `reasoning` item type.
-- **OpenCode** uses SQLite with a `sessions` table and a `messages` table. Parts are stored as JSON in a double-wrapped format: `[{ "type": "text", "data": { "text": "..." } }]`. This is the trickiest format and the main reason this tool exists.
+- **OpenCode** currently uses a global SQLite database with `session`, `message`, and `part` tables. Older project-local databases use `sessions` and `messages`, with parts stored as JSON in a double-wrapped format: `[{ "type": "text", "data": { "text": "..." } }]`. Both schemas are supported.
 
 ## Testing
 
