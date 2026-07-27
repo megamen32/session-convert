@@ -46,7 +46,9 @@ export class OpenCodeWriter {
       // Create tables if they don't exist (basic schema)
       this.ensureSchema(db);
 
-      const sessionId = conv.id || randomUUID();
+      // A conversion always creates a new native session. Reusing a source ID can
+      // overwrite an existing conversation or collide with message primary keys.
+      const sessionId = randomUUID();
       const now = Date.now();
       const createdAt = conv.createdAt ? new Date(conv.createdAt).getTime() : now;
       const updatedAt = conv.updatedAt ? new Date(conv.updatedAt).getTime() : now;
@@ -60,50 +62,48 @@ export class OpenCodeWriter {
       // Calculate costs (approximate)
       const cost = conv.costUsd || this.estimateCost(conv);
 
-      // Insert session
-      db.prepare(
-        "INSERT OR REPLACE INTO sessions (id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at) " +
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-      ).run(
-        sessionId,
-        conv.title.slice(0, 500),
-        messageCount,
-        conv.tokenUsage?.inputTokens || null,
-        conv.tokenUsage?.outputTokens || null,
-        cost,
-        updatedAt,
-        createdAt
-      );
-
-      // Insert messages
       let msgCount = 0;
-      for (const msg of conv.messages) {
-        const parts = this.toOpenCodeParts(msg.parts);
-        if (parts.length === 0) continue;
-
-        const msgId = msg.id || randomUUID();
-        const msgTs = msg.timestamp
-          ? new Date(msg.timestamp).getTime()
-          : now;
-        const msgModel = msg.model || model;
-
+      const writeLegacy = db.transaction(() => {
         db.prepare(
-          "INSERT INTO messages (id, session_id, role, parts, model, created_at, updated_at) " +
-          "VALUES (?, ?, ?, ?, ?, ?, ?)"
-        ).run(msgId, sessionId, msg.role, JSON.stringify(parts), msgModel, msgTs, msgTs);
-
-        // Add finish part for non-streaming compatibility
-        db.prepare(
-          "INSERT INTO messages (id, session_id, role, parts, model, created_at, updated_at) " +
-          "VALUES (?, ?, 'tool', ?, ?, ?, ?)"
+          "INSERT INTO sessions (id, title, message_count, prompt_tokens, completion_tokens, cost, updated_at, created_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         ).run(
-          randomUUID(), sessionId,
-          JSON.stringify([{ type: "finish", data: { reason: "stop", time: Date.now() } }]),
-          msgModel, msgTs, msgTs
+          sessionId,
+          conv.title.slice(0, 500),
+          messageCount,
+          conv.tokenUsage?.inputTokens || null,
+          conv.tokenUsage?.outputTokens || null,
+          cost,
+          updatedAt,
+          createdAt
         );
 
-        msgCount++;
-      }
+        for (const msg of conv.messages) {
+          const parts = this.toOpenCodeParts(msg.parts);
+          if (parts.length === 0) continue;
+
+          const msgId = randomUUID();
+          const msgTs = msg.timestamp ? new Date(msg.timestamp).getTime() : now;
+          const msgModel = msg.model || model;
+          db.prepare(
+            "INSERT INTO messages (id, session_id, role, parts, model, created_at, updated_at) " +
+            "VALUES (?, ?, ?, ?, ?, ?, ?)"
+          ).run(msgId, sessionId, msg.role, JSON.stringify(parts), msgModel, msgTs, msgTs);
+
+          // Add finish part for non-streaming compatibility.
+          db.prepare(
+            "INSERT INTO messages (id, session_id, role, parts, model, created_at, updated_at) " +
+            "VALUES (?, ?, 'tool', ?, ?, ?, ?)"
+          ).run(
+            randomUUID(), sessionId,
+            JSON.stringify([{ type: "finish", data: { reason: "stop", time: Date.now() } }]),
+            msgModel, msgTs, msgTs
+          );
+
+          msgCount++;
+        }
+      });
+      writeLegacy();
 
       db.close();
 
@@ -199,27 +199,34 @@ export class OpenCodeWriter {
         const messageId = this.newOpenCodeId("msg");
         const timestamp = msg.timestamp ? new Date(msg.timestamp).getTime() : now;
         const messageModel = msg.model || modelId;
-        const messageData = {
-          ...(parentId ? { parentID: parentId } : {}),
-          role: msg.role === "assistant" ? "assistant" : "user",
-          mode: "coder",
-          agent: "coder",
-          variant: "default",
-          path: { cwd: projectDir, root: "/" },
-          cost: 0,
-          tokens: {
-            input: msg.usage?.inputTokens || 0,
-            output: msg.usage?.outputTokens || 0,
-            reasoning: msg.usage?.reasoningTokens || 0,
-            cache: {
-              read: msg.usage?.cacheReadTokens || 0,
-              write: msg.usage?.cacheWriteTokens || 0,
-            },
-          },
-          modelID: messageModel,
-          providerID,
-          time: { created: timestamp },
-        };
+        const messageModelRef = this.modelReference(messageModel);
+        const messageData = msg.role === "assistant"
+          ? {
+              parentID: parentId || messageId,
+              role: "assistant",
+              mode: "coder",
+              agent: "coder",
+              path: { cwd: projectDir, root: "/" },
+              cost: 0,
+              tokens: {
+                input: msg.usage?.inputTokens || 0,
+                output: msg.usage?.outputTokens || 0,
+                reasoning: msg.usage?.reasoningTokens || 0,
+                cache: {
+                  read: msg.usage?.cacheReadTokens || 0,
+                  write: msg.usage?.cacheWriteTokens || 0,
+                },
+              },
+              modelID: messageModelRef.modelID,
+              providerID: messageModelRef.providerID,
+              time: { created: timestamp },
+            }
+          : {
+              role: "user",
+              agent: "coder",
+              model: { ...messageModelRef, variant: "default" },
+              time: { created: timestamp },
+            };
         insertMessage.run(messageId, sessionId, timestamp, timestamp, JSON.stringify(messageData));
 
         for (const part of this.toCurrentOpenCodeParts(msg.parts, timestamp, warnings)) {
@@ -242,31 +249,78 @@ export class OpenCodeWriter {
 
   private toCurrentOpenCodeParts(parts: ContentPart[], timestamp: number, warnings: string[]): unknown[] {
     const result: unknown[] = [];
-    for (const part of parts) {
+    for (let index = 0; index < parts.length; index++) {
+      const part = parts[index];
       if (part.type === "text") {
         result.push({ type: "text", text: part.text, time: { start: timestamp, end: timestamp } });
       } else if (part.type === "thinking") {
         result.push({ type: "reasoning", text: part.text, time: { start: timestamp, end: timestamp } });
       } else if (part.type === "tool_call") {
+        const next = parts[index + 1];
+        const matchingResult = next?.type === "tool_result" && next.toolCallId === part.id ? next : undefined;
+        if (matchingResult) index++;
         result.push({
           type: "tool",
           tool: part.name,
           callID: part.id,
           state: {
-            status: part.finished === false ? "pending" : "completed",
-            input: part.input,
-            output: "",
+            ...(matchingResult
+              ? matchingResult.isError
+                ? {
+                    status: "error",
+                    input: part.input,
+                    error: matchingResult.content,
+                    metadata: {},
+                    time: { start: timestamp, end: timestamp },
+                  }
+                : {
+                    status: "completed",
+                    input: part.input,
+                    output: matchingResult.content,
+                    title: this.toolTitle(part.name, part.input),
+                    metadata: {},
+                    time: { start: timestamp, end: timestamp },
+                  }
+              : part.finished === false
+              ? {
+                  status: "pending",
+                  input: part.input,
+                  raw: JSON.stringify(part.input),
+                }
+              : {
+                  status: "completed",
+                  input: part.input,
+                  output: "",
+                  title: this.toolTitle(part.name, part.input),
+                  metadata: {},
+                  time: { start: timestamp, end: timestamp },
+                }),
           },
         });
       } else if (part.type === "tool_result") {
+        const previous = parts[index - 1];
+        if (previous?.type === "tool_call" && previous.id === part.toolCallId) continue;
         result.push({
           type: "tool",
           tool: part.name || "unknown",
           callID: part.toolCallId,
           state: {
-            status: part.isError ? "error" : "completed",
-            input: {},
-            output: part.content,
+            ...(part.isError
+              ? {
+                  status: "error",
+                  input: {},
+                  error: part.content,
+                  metadata: {},
+                  time: { start: timestamp, end: timestamp },
+                }
+              : {
+                  status: "completed",
+                  input: {},
+                  output: part.content,
+                  title: part.name || "unknown",
+                  metadata: {},
+                  time: { start: timestamp, end: timestamp },
+                }),
           },
         });
       } else if (part.type === "image") {
@@ -283,6 +337,22 @@ export class OpenCodeWriter {
 
   private newOpenCodeId(prefix: string): string {
     return `${prefix}_${randomUUID().replaceAll("-", "")}`;
+  }
+
+  private modelReference(model: string): { providerID: string; modelID: string } {
+    const separator = model.indexOf("/");
+    if (separator > 0) {
+      return { providerID: model.slice(0, separator), modelID: model.slice(separator + 1) };
+    }
+    return { providerID: "session-convert", modelID: model };
+  }
+
+  private toolTitle(name: string, input: Record<string, unknown>): string {
+    for (const key of ["description", "command"]) {
+      const value = input[key];
+      if (typeof value === "string" && value.trim()) return value;
+    }
+    return name || "unknown";
   }
 
   private slugify(title: string): string {

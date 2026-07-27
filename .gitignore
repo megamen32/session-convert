@@ -6,3 +6,4 @@ dist/
 tests/fixtures/opencode-project/.opencode/*.db
 tests/fixtures/opencode-project/.opencode/*.db-wal
 tests/fixtures/opencode-project/.opencode/*.db-shm
+trash/

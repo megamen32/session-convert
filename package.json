@@ -3,16 +3,30 @@
   "version": "0.1.0",
   "description": "MCP server to convert AI coding agent sessions between Claude Code, Codex CLI, and OpenCode. The only tool supporting OpenCode SQLite session read/write. Claude-to-Codex, Claude-to-OpenCode, Codex-to-OpenCode and all reverse directions.",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/library.js",
+  "types": "dist/library.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/library.d.ts",
+      "import": "./dist/library.js"
+    },
+    "./cli": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "bin": {
     "session-convert": "dist/index.js"
   },
   "scripts": {
+    "prepare": "npm run build",
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
     "test": "vitest run",
+    "test:release": "npm run build && npm test",
+    "test:release:live": "tsx tests/live-resume-smoke.ts",
     "test:watch": "vitest",
     "test:fixtures": "npx tsx tests/create-opencode-fixture.ts"
   },

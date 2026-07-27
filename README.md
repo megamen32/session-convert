@@ -131,14 +131,22 @@ Source format  →  Unified Conversation  →  Target format
 # Create the OpenCode SQLite test fixture
 npm run test:fixtures
 
-# Run all 34 tests (covers all 6 conversion directions + edge cases)
+# Run all conversion tests (covers all 6 conversion directions + current OpenCode resume shape)
 npm test
+
+# Release gate for offline conversion/build checks
+npm run test:release
+
+# Live release smoke against a running OpenCode backend (uses a cheap model and writes a log)
+OPENCODE_SMOKE_PASSWORD='...' npm run test:release:live
 
 # Watch mode
 npm run test:watch
 ```
 
 Tests use 3 hand-crafted mini-sessions (one per harness) that include text, thinking, tool_call, and tool_result content parts. Each test reads from a fixture, writes to a target format, then reads back to verify roundtrip integrity.
+
+The live smoke requires `OPENCODE_SMOKE_PASSWORD` and uses these optional defaults: `http://127.0.0.1:4095`, project `/home/roomhacker/PycharmProjects/TelegramAuto`, model `opencode/big-pickle`, and log path `trash/logs/`. Override them with `OPENCODE_SMOKE_URL`, `OPENCODE_SMOKE_PROJECT`, `OPENCODE_SMOKE_MODEL`, and `OPENCODE_SMOKE_LOG`.
 
 ## Known Limitations
 

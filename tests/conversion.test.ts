@@ -502,6 +502,84 @@ describe("OpenCodeWriter", () => {
       await rm(tempDir, { recursive: true, force: true });
     }
   });
+
+  it("writes resumable current-schema messages and every tool state", async () => {
+    const tempDir = await mkdtemp(join(homedir(), "sc-test-current-opencode-resume-"));
+    const dbPath = join(tempDir, ".opencode", "opencode.db");
+    await createCurrentOpenCodeDatabase(dbPath);
+
+    try {
+      const conv = makeMiniConversation("oc-current-resume-test", "claude");
+      conv.model = "opencode/deepseek-v4-flash-free";
+      conv.messages = [
+        {
+          id: "resume-user",
+          role: "user",
+          parts: [{ type: "text", text: "Continue this converted session" }],
+          timestamp: "2025-06-15T12:00:00.000Z",
+        },
+        {
+          id: "resume-assistant",
+          role: "assistant",
+          model: "opencode/deepseek-v4-flash-free",
+          parts: [
+            { type: "tool_call", id: "pending-call", name: "Bash", input: { command: "pwd" }, finished: false },
+            { type: "tool_call", id: "completed-call", name: "Read", input: { file_path: "README.md" }, finished: true },
+            { type: "tool_result", toolCallId: "completed-call", name: "Read", content: "README" },
+            { type: "tool_result", toolCallId: "error-call", name: "Bash", content: "failed", isError: true },
+          ],
+          timestamp: "2025-06-15T12:00:05.000Z",
+        },
+      ];
+
+      const result = await new OpenCodeWriter().write(conv, tempDir);
+      expect(result.success).toBe(true);
+
+      const db = new Database(dbPath, { readonly: true });
+      const messages = db.prepare("SELECT data FROM message WHERE session_id = ? ORDER BY time_created").all(result.targetSessionId) as Array<{ data: string }>;
+      const parts = db.prepare("SELECT data FROM part WHERE session_id = ? ORDER BY time_created, id").all(result.targetSessionId) as Array<{ data: string }>;
+      db.close();
+
+      const user = JSON.parse(messages[0].data) as Record<string, any>;
+      expect(user.role).toBe("user");
+      expect(user.model).toEqual({ providerID: "opencode", modelID: "deepseek-v4-flash-free", variant: "default" });
+
+      const states = parts
+        .map((row) => JSON.parse(row.data))
+        .filter((part) => part.type === "tool")
+        .map((part) => part.state);
+      expect(states.map((state) => state.status).sort()).toEqual(["completed", "error", "pending"]);
+      expect(states.find((state) => state.status === "pending")).toMatchObject({
+        status: "pending",
+        input: { command: "pwd" },
+        raw: "{\"command\":\"pwd\"}",
+      });
+      expect(states.filter((state) => state.status === "completed")).toHaveLength(1);
+      for (const state of states.filter((state) => state.status === "completed")) {
+        expect(state).toMatchObject({
+          status: "completed",
+          title: "Read",
+          input: { file_path: "README.md" },
+          output: "README",
+          metadata: {},
+          time: { start: expect.any(Number), end: expect.any(Number) },
+        });
+      }
+      expect(states.find((state) => state.status === "error")).toMatchObject({
+        status: "error",
+        error: "failed",
+        time: { start: expect.any(Number), end: expect.any(Number) },
+      });
+
+      const roundtrip = await new OpenCodeReader().readSessionFromDb(dbPath, result.targetSessionId!);
+      const errorResult = roundtrip!.messages
+        .flatMap((message) => message.parts)
+        .find((part) => part.type === "tool_result" && part.isError);
+      expect(errorResult).toMatchObject({ type: "tool_result", content: "failed", isError: true });
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ===== Roundtrip Tests (Read → Write → Read again) =====

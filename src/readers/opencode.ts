@@ -472,6 +472,15 @@ function parseCurrentParts(partsJson: string): ContentPart[] {
         input,
         finished: status === "completed" || status === "error",
       };
+      if (status === "error" && typeof state.error === "string") {
+        return [call, {
+          type: "tool_result",
+          toolCallId: callId,
+          name: toolName,
+          content: state.error.slice(0, 50_000),
+          isError: true,
+        }];
+      }
       if (typeof state.output === "string") {
         return [call, {
           type: "tool_result",
