@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 420" role="img" aria-labelledby="title desc">
+  <title id="title">session-convert data flow</title>
+  <desc id="desc">Claude Code, Codex CLI, and OpenCode sessions flow through a unified conversation into another native format.</desc>
+  <rect width="1200" height="420" rx="28" fill="#101827"/>
+  <text x="70" y="72" fill="#f8fafc" font-family="sans-serif" font-size="34" font-weight="700">session-convert</text>
+  <text x="70" y="108" fill="#a5b4fc" font-family="sans-serif" font-size="20">Local session portability for coding agents</text>
+  <g font-family="sans-serif" text-anchor="middle">
+    <rect x="70" y="160" width="250" height="150" rx="18" fill="#1e293b" stroke="#64748b" stroke-width="2"/>
+    <text x="195" y="207" fill="#f8fafc" font-size="24" font-weight="700">Source</text>
+    <text x="195" y="244" fill="#cbd5e1" font-size="20">JSONL / SQLite</text>
+    <text x="195" y="277" fill="#94a3b8" font-size="17">Claude · Codex · OpenCode</text>
+    <rect x="475" y="145" width="250" height="180" rx="18" fill="#312e81" stroke="#818cf8" stroke-width="2"/>
+    <text x="600" y="207" fill="#fff" font-size="24" font-weight="700">Normalize</text>
+    <text x="600" y="244" fill="#e0e7ff" font-size="20">Conversation</text>
+    <text x="600" y="278" fill="#c7d2fe" font-size="17">messages · tools · metadata</text>
+    <rect x="880" y="160" width="250" height="150" rx="18" fill="#1e293b" stroke="#64748b" stroke-width="2"/>
+    <text x="1005" y="207" fill="#f8fafc" font-size="24" font-weight="700">Target</text>
+    <text x="1005" y="244" fill="#cbd5e1" font-size="20">Native session</text>
+    <text x="1005" y="277" fill="#94a3b8" font-size="17">continue where you work</text>
+  </g>
+  <path d="M330 235h125M745 235h125" stroke="#a5b4fc" stroke-width="5" stroke-linecap="round"/><path d="m440 220 18 15-18 15M855 220l18 15-18 15" fill="none" stroke="#a5b4fc" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
